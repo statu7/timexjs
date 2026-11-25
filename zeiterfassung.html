@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Arbeitszeiterfassung</title>
+<style>
+*{box-sizing:border-box}body{font-family:Tahoma,Arial,sans-serif;background:#f4f5f7;margin:0;padding:20px;color:#202124}
+.app{max-width:1500px;margin:auto;background:#fff;padding:18px;border-radius:10px;box-shadow:0 4px 16px #0001}
+.controls{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:15px}
+select,button{font:inherit;padding:8px 11px;border:1px solid #aaa;border-radius:5px;background:#fff}
+button{cursor:pointer;font-weight:700}.save{background:#1b5e20;color:#fff;border-color:#1b5e20}.open{background:#455a64;color:#fff;border-color:#455a64}
+.status{margin-left:auto;font-size:13px;color:#555}.wrap{overflow:auto}
+table{border-collapse:collapse;width:100%;min-width:1200px;table-layout:fixed;font-size:13px}
+th,td{border:1px solid #c000c0;padding:4px}th{padding:7px 4px;text-align:center;background:#fff;font-weight:400}
+tbody td{background:#fff}.weekend td,.holiday td{background:#c6efce}.weekend td{color:red}.holiday td{color:#202124}
+input,textarea{width:100%;border:0;background:transparent;outline:0;font:inherit;padding:5px}
+input[type=time]{text-align:center}textarea{min-height:30px;resize:vertical}.center{text-align:center}
+.holiday-box{width:auto;transform:scale(1.15);cursor:pointer}.holiday-cell{text-align:center;background:#f7f7f7!important;color:#202124!important}
+tfoot td{background:#fff;font-weight:bold}.grand{background:#31a852!important;color:#fff;text-align:center;font-size:15px}
+.note{font-size:12px;color:#666;margin-top:12px;line-height:1.45}
+@media(max-width:700px){body{padding:6px}.app{padding:9px}.status{width:100%;margin-left:0}}
+</style></head>
+<body><div class="app">
+<div class="controls"><strong>Monat:</strong><select id="month"></select><strong>Jahr:</strong><select id="year"></select><strong>Feiertagsregion:</strong><select id="canton"></select>
+<button class="open" id="openBtn">Ordner verbinden</button><button class="save" id="saveBtn">In Arbeitszeiterfassung.xlsx speichern</button><span class="status" id="status">Bereit</span></div>
+<div class="wrap"><table><thead><tr><th>Tag</th><th>Datum</th><th>Vormittag von</th><th>Vormittag bis</th><th>Nachmittag von</th><th>Nachmittag bis</th><th>Tätigkeit</th><th>Gesamt St.</th><th>Wochenstunden</th><th>Feiertag</th><th>Ferientag</th></tr></thead>
+<tbody id="body"></tbody><tfoot><tr><td colspan="7" style="text-align:right">Monat gesamt:</td><td class="grand" id="total">00:00</td><td></td><td></td><td></td></tr></tfoot></table></div>
+<div class="note"><b>Excel ist die Master-Datenquelle. Die Excel-Datei wird mit der lokal mitgelieferten ExcelJS-Bibliothek gelesen und gespeichert. Die Masterdatei startet nur mit der Vorlage <b>Tabelle1</b>; ein Monatsblatt wird erst beim ersten echten Eintrag dieses Monats erstellt.</b> Beim ersten Start einmal den Ordner auswählen, in dem <b>zeiterfassung.html</b> und <b>Arbeitszeiterfassung.xlsx</b> liegen. Edge merkt sich diesen Ordner. Danach lädt die App beim Start automatisch aus <b>Arbeitszeiterfassung.xlsx</b>, sofern die Browser-Berechtigung weiterhin vorhanden ist. Feiertage werden anhand der gewählten Region automatisch grün markiert; persönliche Ferientage können zusätzlich manuell markiert werden.</div>
+</div><script src="exceljs.min.js"></script><script>
+
+const MASTER_FILE="Arbeitszeiterfassung.xlsx";
+let directoryHandle=null, excelWorkbook=null;
+
+function idbOpen(){return new Promise((res,rej)=>{let r=indexedDB.open("ZeiterfassungDB",1);r.onupgradeneeded=()=>{if(!r.result.objectStoreNames.contains("handles"))r.result.createObjectStore("handles")};r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error)})}
+async function idbSet(k,v){let db=await idbOpen();return new Promise((res,rej)=>{let t=db.transaction("handles","readwrite");t.objectStore("handles").put(v,k);t.oncomplete=()=>res();t.onerror=()=>rej(t.error)})}
+async function idbGet(k){let db=await idbOpen();return new Promise((res,rej)=>{let r=db.transaction("handles").objectStore("handles").get(k);r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error)})}
+function currentSheetName(){return `${shortMonths[+M.value-1]} ${String(Y.value).slice(-2)}`}
+function deep(v){if(v===undefined||v===null)return v;if(v instanceof Date)return new Date(v);return JSON.parse(JSON.stringify(v))}
+function asTime(v){if(v===null||v===undefined||v==="")return "";if(typeof v==="number"){let n=Math.round((v-Math.floor(v))*1440)%1440;return `${String(Math.floor(n/60)).padStart(2,"0")}:${String(n%60).padStart(2,"0")}`}if(v instanceof Date)return `${String(v.getUTCHours()).padStart(2,"0")}:${String(v.getUTCMinutes()).padStart(2,"0")}`;let m=String(v).match(/(\d{1,2}):(\d{2})/);return m?`${m[1].padStart(2,"0")}:${m[2]}`:""}
+function timeFraction(v){if(!v)return null;let [h,m]=v.split(":").map(Number);return (h*60+m)/1440}
+function meaningful(v){return !!(v.morningFrom||v.morningTo||v.afternoonFrom||v.afternoonTo||String(v.task||"").trim()||v.holiday)}
+function copyCell(src,dst,withValue=true){if(withValue)dst.value=deep(src.value);dst.style=deep(src.style||{});if(src.numFmt)dst.numFmt=src.numFmt;dst.dataValidation=deep(src.dataValidation||{});}
+function cloneTemplateSheet(wb,name){
+ const t=wb.getWorksheet("Tabelle1");if(!t)throw Error("Vorlage 'Tabelle1' fehlt.");
+ const ws=wb.addWorksheet(name,{views:[{showGridLines:false}]});
+ t.columns.forEach((c,i)=>{let d=ws.getColumn(i+1);d.width=c.width;d.hidden=c.hidden});
+ t.eachRow({includeEmpty:true},(sr,rn)=>{let dr=ws.getRow(rn);dr.height=sr.height;sr.eachCell({includeEmpty:true},(sc,cn)=>{let dc=dr.getCell(cn);dc.value=deep(sc.value);dc.style=deep(sc.style||{});dc.numFmt=sc.numFmt||dc.numFmt})});
+ return ws;
+}
+function copyTemplateRowStyle(ws,row,green,weekend){
+ const t=excelWorkbook.getWorksheet("Tabelle1"),normalRef=(row%2===1?7:8),greenRef=12;
+ for(let c=6;c<=14;c++){let src=t.getCell(normalRef,c),dst=ws.getCell(row,c);dst.style=deep(src.style||{});if(green){dst.fill={type:'pattern',pattern:'solid',fgColor:{argb:'FF92D050'}};if((c===6||c===7)&&weekend)dst.font={...(deep(src.font||{})),color:{argb:'FFFF0000'}}}}
+}
+async function loadMaster(){
+ try{if(!directoryHandle)return false;let perm=await directoryHandle.queryPermission({mode:"readwrite"});if(perm!=="granted")return false;
+ let fh=await directoryHandle.getFileHandle(MASTER_FILE),f=await fh.getFile();let candidate=new ExcelJS.Workbook();await candidate.xlsx.load(await f.arrayBuffer());excelWorkbook=candidate;loadCurrentSheet();S.textContent="Arbeitszeiterfassung.xlsx geladen";return true}
+ catch(e){console.error(e);S.textContent="Excel-Datei konnte nicht geladen werden: "+(e?.message||e);return false}
+}
+function loadCurrentSheet(){
+ if(!excelWorkbook)return;const y=Number(Y.value),m=Number(M.value);let ws=excelWorkbook.getWorksheet(`${shortMonths[m-1]} ${String(y).slice(-2)}`);if(!ws){workbook[`${y}-${pad(m)}`]=[];render();S.textContent=`${shortMonths[m-1]} ${String(y).slice(-2)} ist noch nicht angelegt`;return}
+ let arr=[],holidays=regionHolidays(y,C.value),maxDays=new Date(y,m,0).getDate();
+ for(let d=1;d<=maxDays;d++){let r=d+6,dt=new Date(y,m-1,d),publicHoliday=!!holidays[isoDate(y,m,d)];let tv=ws.getCell(r,12).value;arr.push({day:d,morningFrom:asTime(ws.getCell(r,8).value),morningTo:asTime(ws.getCell(r,9).value),afternoonFrom:asTime(ws.getCell(r,10).value),afternoonTo:asTime(ws.getCell(r,11).value),task:typeof tv==='string'?tv:(tv?.text||''),holiday:Number(ws.getCell(r,15).value||0)===1&&!publicHoliday&&![0,6].includes(dt.getDay())})}
+ workbook[`${y}-${pad(m)}`]=arr;render()
+}
+async function saveMaster(){
+ try{
+  if(!directoryHandle){await connectFolder();if(!directoryHandle)return}if(!excelWorkbook){let ok=await loadMaster();if(!ok)return}
+  persist();const y=Number(Y.value),m=Number(M.value),name=`${shortMonths[m-1]} ${String(y).slice(-2)}`,data=workbook[`${y}-${pad(m)}`]||[],hasData=data.some(meaningful);let ws=excelWorkbook.getWorksheet(name);
+  if(!ws&&!hasData){S.textContent=`Keine Einträge – ${name} wurde nicht angelegt`;return}if(!ws)ws=cloneTemplateSheet(excelWorkbook,name);
+  const monthDays=new Date(y,m,0).getDate(),holidays=regionHolidays(y,C.value),byDay=new Map(data.map(v=>[+v.day,v]));
+  ws.getCell('I3').value=new Date(Date.UTC(y,m-1,1,12));ws.getCell('I3').numFmt='mmm-yy';
+  let weekStart=7;
+  for(let d=1;d<=31;d++){let r=d+6,v=byDay.get(d)||empty(d),valid=d<=monthDays;
+   if(!valid){for(let c=6;c<=15;c++)ws.getCell(r,c).value=null;continue}
+   let dt=new Date(y,m-1,d),weekend=[0,6].includes(dt.getDay()),green=weekend||!!holidays[isoDate(y,m,d)]||!!v.holiday;copyTemplateRowStyle(ws,r,green,weekend);
+   ws.getCell(r,6).value=days[dt.getDay()];ws.getCell(r,7).value=d;
+   for(const [c,val] of [[8,v.morningFrom],[9,v.morningTo],[10,v.afternoonFrom],[11,v.afternoonTo]]){ws.getCell(r,c).value=timeFraction(val);ws.getCell(r,c).numFmt='hh:mm'}
+   ws.getCell(r,12).value=v.task||'';ws.getCell(r,13).value={formula:`IFERROR(((I${r}-H${r})+(K${r}-J${r}))*24,0)`,result:0};ws.getCell(r,13).numFmt='0.00 "St."';ws.getCell(r,15).value=v.holiday?1:null;
+   if(dt.getDay()===0||d===monthDays){ws.getCell(r,14).value={formula:`SUM(M${weekStart}:M${r})`,result:0};ws.getCell(r,14).numFmt='0.00 "St."';weekStart=r+1}else ws.getCell(r,14).value=null;
+  }
+  ws.getColumn(15).hidden=true;ws.getCell('M38').value={formula:'SUM(M7:M37)',result:0};ws.getCell('M38').numFmt='0.00 "St."';
+  let out=await excelWorkbook.xlsx.writeBuffer();let fh=await directoryHandle.getFileHandle(MASTER_FILE),w=await fh.createWritable();await w.write(out);await w.close();
+  let saved=await (await fh.getFile()).arrayBuffer(),check=new ExcelJS.Workbook();await check.xlsx.load(saved);if(!check.getWorksheet(name))throw Error('Gespeichertes Monatsblatt fehlt bei der Kontrollprüfung.');excelWorkbook=check;loadCurrentSheet();S.textContent=`Gespeichert und geprüft: ${name}`
+ }catch(e){console.error(e);S.textContent='Speichern fehlgeschlagen: '+(e?.message||e)}
+}
+async function connectFolder(){try{directoryHandle=await window.showDirectoryPicker({mode:"readwrite"});await idbSet("masterDirectory",directoryHandle);let p=await directoryHandle.requestPermission({mode:"readwrite"});if(p==="granted")await loadMaster()}catch(e){if(e.name!=="AbortError"){console.error(e);S.textContent="Ordner konnte nicht verbunden werden"}}}
+async function autoMaster(){if(!("showDirectoryPicker"in window)){S.textContent="Bitte Microsoft Edge oder Chrome verwenden";return}try{directoryHandle=await idbGet("masterDirectory");if(directoryHandle){let p=await directoryHandle.queryPermission({mode:"readwrite"});if(p==="granted"){await loadMaster();return}S.textContent="Ordner-Berechtigung erforderlich – einmal 'Ordner verbinden' klicken"}else S.textContent="Erster Start – einmal 'Ordner verbinden' klicken"}catch(e){console.error(e)}}
+const months=["Januar","Februar","März","April","Mai","Juni","Juli","August","September","Oktober","November","Dezember"];
+const shortMonths=["Jan","Feb","Mär","Apr","Mai","Jun","Jul","Aug","Sep","Okt","Nov","Dez"];
+const days=["Sonntag","Montag","Dienstag","Mittwoch","Donnerstag","Freitag","Samstag"];
+const cantons=[
+["AG","Aargau"],["AI","Appenzell Innerrhoden"],["AR","Appenzell Ausserrhoden"],["BE","Bern"],["BL","Basel-Landschaft"],["BS","Basel-Stadt"],
+["FR","Freiburg"],["GE","Genf"],["GL","Glarus"],["GR","Graubünden"],["JU","Jura"],["LU","Luzern"],["NE","Neuenburg"],["NW","Nidwalden"],
+["OW","Obwalden"],["SG","St. Gallen"],["SH","Schaffhausen"],["SO","Solothurn"],["SZ","Schwyz"],["TG","Thurgau"],["TI","Tessin"],
+["UR","Uri"],["VD","Waadt"],["VS","Wallis"],["ZG","Zug"],["ZH","Zürich"]];
+const C=document.getElementById("canton");
+const germanRegions=[["DE-NI","Deutschland – Niedersachsen"]];
+function isoDate(y,m,d){return `${y}-${pad(m)}-${pad(d)}`}
+function easter(y){let a=y%19,b=Math.floor(y/100),c=y%100,d=Math.floor(b/4),e=b%4,f=Math.floor((b+8)/25),g=Math.floor((b-f+1)/3),h=(19*a+b-d-g+15)%30,i=Math.floor(c/4),k=c%4,l=(32+2*e+2*i-h-k)%7,m=Math.floor((a+11*h+22*l)/451),mo=Math.floor((h+l-7*m+114)/31),da=((h+l-7*m+114)%31)+1;return new Date(y,mo-1,da)}
+function addDays(dt,n){let x=new Date(dt);x.setDate(x.getDate()+n);return x}
+function hkey(dt){return isoDate(dt.getFullYear(),dt.getMonth()+1,dt.getDate())}
+function regionHolidays(y,c){
+ if(c==="DE-NI"){
+  const h={},add=(m,d,name)=>h[isoDate(y,m,d)]=name,e=easter(y),move=(n,name)=>h[hkey(addDays(e,n))]=name;
+  add(1,1,"Neujahr");move(-2,"Karfreitag");move(1,"Ostermontag");
+  add(5,1,"Tag der Arbeit");move(39,"Christi Himmelfahrt");move(50,"Pfingstmontag");
+  add(10,3,"Tag der Deutschen Einheit");add(10,31,"Reformationstag");
+  add(12,25,"1. Weihnachtstag");add(12,26,"2. Weihnachtstag");return h;
+ }
+ return swissHolidays(y,c);
+}
+function swissHolidays(y,c){
+ let h={}; const add=(m,d,n)=>h[isoDate(y,m,d)]=n, eas=easter(y), move=(n,name)=>h[hkey(addDays(eas,n))]=name;
+ // Broadly observed / federal-equivalent days
+ add(1,1,"Neujahr"); move(39,"Auffahrt"); add(8,1,"Bundesfeier"); add(12,25,"Weihnachten");
+ // Common cantonal public holidays
+ const jan2=["AG","BE","BL","BS","FR","GL","GR","JU","LU","NE","OW","SH","SO","TG","VD","ZG","ZH"];
+ if(jan2.includes(c))add(1,2,"Berchtoldstag");
+ const goodFriday=["AG","AR","BE","BL","BS","FR","GE","GL","GR","JU","NE","SG","SH","SO","TG","VD","ZH"];
+ if(goodFriday.includes(c))move(-2,"Karfreitag");
+ const easterMonday=["AG","AR","BE","BL","BS","FR","GE","GL","GR","JU","LU","NE","SG","SH","SO","TG","TI","VD","ZH"];
+ if(easterMonday.includes(c))move(1,"Ostermontag");
+ const whitMonday=["AG","AR","BE","BL","BS","FR","GE","GL","GR","JU","LU","NE","SG","SH","SO","TG","VD","ZH"];
+ if(whitMonday.includes(c))move(50,"Pfingstmontag");
+ const corpus=["AI","FR","JU","LU","NW","OW","SO","SZ","TI","UR","VS","ZG"];
+ if(corpus.includes(c))move(60,"Fronleichnam");
+ const assumption=["AI","FR","JU","LU","NW","OW","SO","SZ","TI","UR","VS","ZG"];
+ if(assumption.includes(c))add(8,15,"Mariä Himmelfahrt");
+ const allSaints=["AI","FR","JU","LU","NW","OW","SO","SZ","TI","UR","VS","ZG"];
+ if(allSaints.includes(c))add(11,1,"Allerheiligen");
+ const immaculate=["AI","FR","LU","NW","OW","SZ","TI","UR","VS","ZG"];
+ if(immaculate.includes(c))add(12,8,"Mariä Empfängnis");
+ const stephen=["AI","AR","BE","BL","BS","FR","GL","GR","LU","NW","OW","SG","SH","SZ","TG","TI","UR","VS","ZG","ZH"];
+ if(stephen.includes(c))add(12,26,"Stephanstag");
+ // Canton-specific well-known days
+ if(c==="GE"){add(12,31,"Restauration de la République");}
+ if(c==="NE"){add(3,1,"Ausrufung der Republik");}
+ if(c==="JU"){add(6,23,"Unabhängigkeitstag Jura");}
+ return h;
+}
+
+const M=document.getElementById("month"),Y=document.getElementById("year"),B=document.getElementById("body"),S=document.getElementById("status");
+let fileHandle=null,workbook={};
+function esc(s){return String(s??"").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;")}
+function pad(n){return String(n).padStart(2,"0")}function mins(v){if(!v)return 0;let[h,m]=v.split(":").map(Number);return h*60+m}
+function dur(a,b){return a&&b?Math.max(0,mins(b)-mins(a)):0}function fmt(n){return pad(Math.floor(n/60))+":"+pad(n%60)}
+function key(){return`${Y.value}-${pad(M.value)}`}function dim(){return new Date(+Y.value,+M.value,0).getDate()}
+function init(){let n=new Date();months.forEach((x,i)=>M.add(new Option(x,i+1)));for(let y=n.getFullYear()-5;y<=n.getFullYear()+5;y++)Y.add(new Option(y,y));M.value=String(n.getMonth()+1);Y.value=String(n.getFullYear());cantons.forEach(([code,name])=>C.add(new Option(`${code} – ${name}`,code)));germanRegions.forEach(([code,name])=>C.add(new Option(name,code)));C.value=localStorage.getItem("zeiterfassung_canton")||"ZH";render()}
+function empty(d){return{day:d,morningFrom:"",morningTo:"",afternoonFrom:"",afternoonTo:"",task:"",holiday:false}}
+function collect(){return[...B.querySelectorAll("tr")].map(tr=>{let g=f=>tr.querySelector(`[data-f="${f}"]`)?.value||"";return{day:+tr.dataset.day,morningFrom:g("morningFrom"),morningTo:g("morningTo"),afternoonFrom:g("afternoonFrom"),afternoonTo:g("afternoonTo"),task:g("task"),holiday:tr.querySelector('[data-f="holiday"]').checked}})}
+function persist(){workbook[key()]=collect()}
+function render(){let map=new Map((workbook[key()]||[]).map(x=>[+x.day,x])),holidays=regionHolidays(+Y.value,C.value);B.innerHTML="";
+for(let d=1;d<=dim();d++){let dt=new Date(+Y.value,+M.value-1,d),v={...empty(d),...(map.get(d)||{})},we=[0,6].includes(dt.getDay()),tr=document.createElement("tr");tr.className=we?"weekend":(v.holiday?"holiday":"");tr.dataset.day=d;
+let publicHoliday=holidays[isoDate(+Y.value,+M.value,d)]||"";if(publicHoliday&&!we)tr.classList.add("holiday");
+tr.innerHTML=`<td class=center>${days[dt.getDay()]}</td><td class=center>${d}</td><td><input type=time data-f=morningFrom value="${esc(v.morningFrom)}"></td><td><input type=time data-f=morningTo value="${esc(v.morningTo)}"></td><td><input type=time data-f=afternoonFrom value="${esc(v.afternoonFrom)}"></td><td><input type=time data-f=afternoonTo value="${esc(v.afternoonTo)}"></td><td><textarea data-f=task></textarea></td><td class="center daily">00:00</td><td class="center weekly"></td><td class="center">${esc(publicHoliday)}</td><td class="holiday-cell"><input class="holiday-box" type=checkbox data-f=holiday ${v.holiday?"checked":""} ${we||publicHoliday?"disabled":""}></td>`;
+tr.querySelector("textarea").value=v.task||"";B.appendChild(tr)}
+B.querySelectorAll("input,textarea").forEach(e=>e.addEventListener("input",()=>{let tr=e.closest("tr");if(e.dataset.f==="holiday"&&!tr.classList.contains("weekend"))tr.classList.toggle("holiday",e.checked);calc();persist();S.textContent="Änderungen noch nicht in Excel gespeichert"}));calc()}
+function calc(){let total=0,week=0,rows=[...B.querySelectorAll("tr")];rows.forEach((tr,i)=>{let g=f=>tr.querySelector(`[data-f="${f}"]`)?.value||"",n=dur(g("morningFrom"),g("morningTo"))+dur(g("afternoonFrom"),g("afternoonTo"));total+=n;week+=n;tr.querySelector(".daily").textContent=fmt(n);tr.querySelector(".weekly").textContent="";let dt=new Date(+Y.value,+M.value-1,+tr.dataset.day);if(dt.getDay()===0||i===rows.length-1){tr.querySelector(".weekly").textContent=fmt(week);week=0}});document.getElementById("total").textContent=fmt(total)}
+M.onchange=()=>{if(excelWorkbook)loadCurrentSheet();else render()};Y.onchange=()=>{if(excelWorkbook)loadCurrentSheet();else render()};C.onchange=()=>{localStorage.setItem("zeiterfassung_canton",C.value);render()};
+
+document.getElementById("saveBtn").onclick=saveMaster;document.getElementById("openBtn").onclick=connectFolder;init();setTimeout(autoMaster,0);
+</script></body></html>
