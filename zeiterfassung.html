@@ -14,7 +14,7 @@ table{border-collapse:collapse;width:100%;min-width:1200px;table-layout:fixed;fo
 th,td{border:1px solid #c000c0;padding:4px}th{padding:7px 4px;text-align:center;background:#fff;font-weight:400}
 tbody td{background:#fff}.weekend td,.holiday td{background:#c6efce}.weekend td{color:red}.holiday td{color:#202124}
 input,textarea{width:100%;border:0;background:transparent;outline:0;font:inherit;padding:5px}
-input[type=time]{text-align:center}textarea{min-height:30px;resize:vertical}.center{text-align:center}
+input[type=time]{text-align:center}input[type=time]:disabled{cursor:not-allowed;opacity:.45}textarea{min-height:30px;resize:vertical}.center{text-align:center}
 .holiday-box{width:auto;transform:scale(1.15);cursor:pointer}.holiday-cell{text-align:center;background:#f7f7f7!important;color:#202124!important}
 tfoot td{background:#fff;font-weight:bold}.grand{background:#31a852!important;color:#fff;text-align:center;font-size:15px}
 .note{font-size:12px;color:#666;margin-top:12px;line-height:1.45}
@@ -25,11 +25,12 @@ tfoot td{background:#fff;font-weight:bold}.grand{background:#31a852!important;co
 <button class="open" id="openBtn">Ordner verbinden</button><button class="save" id="saveBtn">In Arbeitszeiterfassung.xlsx speichern</button><span class="status" id="status">Bereit</span></div>
 <div class="wrap"><table><thead><tr><th>Tag</th><th>Datum</th><th>Vormittag von</th><th>Vormittag bis</th><th>Nachmittag von</th><th>Nachmittag bis</th><th>Tätigkeit</th><th>Gesamt St.</th><th>Wochenstunden</th><th>Feiertag</th><th>Ferientag</th></tr></thead>
 <tbody id="body"></tbody><tfoot><tr><td colspan="7" style="text-align:right">Monat gesamt:</td><td class="grand" id="total">00:00</td><td></td><td></td><td></td></tr></tfoot></table></div>
-<div class="note"><b>Excel ist die Master-Datenquelle. Die Excel-Datei wird mit der lokal mitgelieferten ExcelJS-Bibliothek gelesen und gespeichert. Die Masterdatei startet nur mit der Vorlage <b>Tabelle1</b>; ein Monatsblatt wird erst beim ersten echten Eintrag dieses Monats erstellt.</b> Beim ersten Start einmal den Ordner auswählen, in dem <b>zeiterfassung.html</b> und <b>Arbeitszeiterfassung.xlsx</b> liegen. Edge merkt sich diesen Ordner. Danach lädt die App beim Start automatisch aus <b>Arbeitszeiterfassung.xlsx</b>, sofern die Browser-Berechtigung weiterhin vorhanden ist. Feiertage werden anhand der gewählten Region automatisch grün markiert; persönliche Ferientage können zusätzlich manuell markiert werden.</div>
+<div class="note"><b>Excel ist die Master-Datenquelle. Die Excel-Datei wird mit der lokal mitgelieferten ExcelJS-Bibliothek gelesen und gespeichert. Die Masterdatei startet nur mit der Vorlage <b>Tabelle1</b>; ein Monatsblatt wird erst beim ersten echten Eintrag dieses Monats erstellt.</b> Beim ersten Start einmal den Ordner auswählen, in dem <b>zeiterfassung.html</b> und <b>Arbeitszeiterfassung.xlsx</b> liegen. Edge merkt sich diesen Ordner. Danach lädt die App beim Start automatisch aus <b>Arbeitszeiterfassung.xlsx</b>, sofern die Browser-Berechtigung weiterhin vorhanden ist. Feiertage werden anhand der gewählten Region automatisch grün markiert; persönliche Ferientage können zusätzlich manuell markiert werden. Vor jedem Speichern wird der bisherige Stand automatisch als <b>Arbeitszeiterfassung.backup.xlsx</b> gesichert.</div>
 </div><script src="exceljs.min.js"></script><script>
 
 const MASTER_FILE="Arbeitszeiterfassung.xlsx";
-let directoryHandle=null, excelWorkbook=null;
+const BACKUP_FILE="Arbeitszeiterfassung.backup.xlsx";
+let directoryHandle=null, excelWorkbook=null, dirty=false;
 
 function idbOpen(){return new Promise((res,rej)=>{let r=indexedDB.open("ZeiterfassungDB",1);r.onupgradeneeded=()=>{if(!r.result.objectStoreNames.contains("handles"))r.result.createObjectStore("handles")};r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error)})}
 async function idbSet(k,v){let db=await idbOpen();return new Promise((res,rej)=>{let t=db.transaction("handles","readwrite");t.objectStore("handles").put(v,k);t.oncomplete=()=>res();t.onerror=()=>rej(t.error)})}
@@ -65,6 +66,7 @@ function loadCurrentSheet(){
 async function saveMaster(){
  try{
   if(!directoryHandle){await connectFolder();if(!directoryHandle)return}if(!excelWorkbook){let ok=await loadMaster();if(!ok)return}
+  try{let curFh=await directoryHandle.getFileHandle(MASTER_FILE),curBytes=await (await curFh.getFile()).arrayBuffer(),bakFh=await directoryHandle.getFileHandle(BACKUP_FILE,{create:true}),bw=await bakFh.createWritable();await bw.write(curBytes);await bw.close()}catch(e){console.warn("Sicherung vor dem Speichern fehlgeschlagen:",e)}
   persist();const y=Number(Y.value),m=Number(M.value),name=`${shortMonths[m-1]} ${String(y).slice(-2)}`,data=workbook[`${y}-${pad(m)}`]||[],hasData=data.some(meaningful);let ws=excelWorkbook.getWorksheet(name);
   if(!ws&&!hasData){S.textContent=`Keine Einträge – ${name} wurde nicht angelegt`;return}if(!ws)ws=cloneTemplateSheet(excelWorkbook,name);
   const monthDays=new Date(y,m,0).getDate(),holidays=regionHolidays(y,C.value),byDay=new Map(data.map(v=>[+v.day,v]));
@@ -80,8 +82,8 @@ async function saveMaster(){
   }
   ws.getColumn(15).hidden=true;ws.getCell('M38').value={formula:'SUM(M7:M37)',result:0};ws.getCell('M38').numFmt='0.00 "St."';
   let out=await excelWorkbook.xlsx.writeBuffer();let fh=await directoryHandle.getFileHandle(MASTER_FILE),w=await fh.createWritable();await w.write(out);await w.close();
-  let saved=await (await fh.getFile()).arrayBuffer(),check=new ExcelJS.Workbook();await check.xlsx.load(saved);if(!check.getWorksheet(name))throw Error('Gespeichertes Monatsblatt fehlt bei der Kontrollprüfung.');excelWorkbook=check;loadCurrentSheet();S.textContent=`Gespeichert und geprüft: ${name}`
- }catch(e){console.error(e);S.textContent='Speichern fehlgeschlagen: '+(e?.message||e)}
+  let saved=await (await fh.getFile()).arrayBuffer(),check=new ExcelJS.Workbook();await check.xlsx.load(saved);if(!check.getWorksheet(name))throw Error('Gespeichertes Monatsblatt fehlt bei der Kontrollprüfung.');excelWorkbook=check;loadCurrentSheet();dirty=false;S.textContent=`Gespeichert und geprüft: ${name}`
+ }catch(e){console.error(e);S.textContent='Speichern fehlgeschlagen: '+(e?.message||e)+' – letzte Sicherung liegt in '+BACKUP_FILE}
 }
 async function connectFolder(){try{directoryHandle=await window.showDirectoryPicker({mode:"readwrite"});await idbSet("masterDirectory",directoryHandle);let p=await directoryHandle.requestPermission({mode:"readwrite"});if(p==="granted")await loadMaster()}catch(e){if(e.name!=="AbortError"){console.error(e);S.textContent="Ordner konnte nicht verbunden werden"}}}
 async function autoMaster(){if(!("showDirectoryPicker"in window)){S.textContent="Bitte Microsoft Edge oder Chrome verwenden";return}try{directoryHandle=await idbGet("masterDirectory");if(directoryHandle){let p=await directoryHandle.queryPermission({mode:"readwrite"});if(p==="granted"){await loadMaster();return}S.textContent="Ordner-Berechtigung erforderlich – einmal 'Ordner verbinden' klicken"}else S.textContent="Erster Start – einmal 'Ordner verbinden' klicken"}catch(e){console.error(e)}}
@@ -152,11 +154,13 @@ function persist(){workbook[key()]=collect()}
 function render(){let map=new Map((workbook[key()]||[]).map(x=>[+x.day,x])),holidays=regionHolidays(+Y.value,C.value);B.innerHTML="";
 for(let d=1;d<=dim();d++){let dt=new Date(+Y.value,+M.value-1,d),v={...empty(d),...(map.get(d)||{})},we=[0,6].includes(dt.getDay()),tr=document.createElement("tr");tr.className=we?"weekend":(v.holiday?"holiday":"");tr.dataset.day=d;
 let publicHoliday=holidays[isoDate(+Y.value,+M.value,d)]||"";if(publicHoliday&&!we)tr.classList.add("holiday");
-tr.innerHTML=`<td class=center>${days[dt.getDay()]}</td><td class=center>${d}</td><td><input type=time data-f=morningFrom value="${esc(v.morningFrom)}"></td><td><input type=time data-f=morningTo value="${esc(v.morningTo)}"></td><td><input type=time data-f=afternoonFrom value="${esc(v.afternoonFrom)}"></td><td><input type=time data-f=afternoonTo value="${esc(v.afternoonTo)}"></td><td><textarea data-f=task></textarea></td><td class="center daily">00:00</td><td class="center weekly"></td><td class="center">${esc(publicHoliday)}</td><td class="holiday-cell"><input class="holiday-box" type=checkbox data-f=holiday ${v.holiday?"checked":""} ${we||publicHoliday?"disabled":""}></td>`;
+let green=we||!!publicHoliday||v.holiday,timeDisabled=green?"disabled":"";
+tr.innerHTML=`<td class=center>${days[dt.getDay()]}</td><td class=center>${d}</td><td><input type=time data-f=morningFrom value="${esc(v.morningFrom)}" ${timeDisabled}></td><td><input type=time data-f=morningTo value="${esc(v.morningTo)}" ${timeDisabled}></td><td><input type=time data-f=afternoonFrom value="${esc(v.afternoonFrom)}" ${timeDisabled}></td><td><input type=time data-f=afternoonTo value="${esc(v.afternoonTo)}" ${timeDisabled}></td><td><textarea data-f=task></textarea></td><td class="center daily">00:00</td><td class="center weekly"></td><td class="center">${esc(publicHoliday)}</td><td class="holiday-cell"><input class="holiday-box" type=checkbox data-f=holiday ${v.holiday?"checked":""} ${we||publicHoliday?"disabled":""}></td>`;
 tr.querySelector("textarea").value=v.task||"";B.appendChild(tr)}
-B.querySelectorAll("input,textarea").forEach(e=>e.addEventListener("input",()=>{let tr=e.closest("tr");if(e.dataset.f==="holiday"&&!tr.classList.contains("weekend"))tr.classList.toggle("holiday",e.checked);calc();persist();S.textContent="Änderungen noch nicht in Excel gespeichert"}));calc()}
+B.querySelectorAll("input,textarea").forEach(e=>e.addEventListener("input",()=>{let tr=e.closest("tr");if(e.dataset.f==="holiday"){if(!tr.classList.contains("weekend"))tr.classList.toggle("holiday",e.checked);tr.querySelectorAll('input[type=time]').forEach(t=>{t.disabled=e.checked;if(e.checked)t.value=""})}calc();persist();dirty=true;S.textContent="Änderungen noch nicht in Excel gespeichert"}));calc()}
 function calc(){let total=0,week=0,rows=[...B.querySelectorAll("tr")];rows.forEach((tr,i)=>{let g=f=>tr.querySelector(`[data-f="${f}"]`)?.value||"",n=dur(g("morningFrom"),g("morningTo"))+dur(g("afternoonFrom"),g("afternoonTo"));total+=n;week+=n;tr.querySelector(".daily").textContent=fmt(n);tr.querySelector(".weekly").textContent="";let dt=new Date(+Y.value,+M.value-1,+tr.dataset.day);if(dt.getDay()===0||i===rows.length-1){tr.querySelector(".weekly").textContent=fmt(week);week=0}});document.getElementById("total").textContent=fmt(total)}
 M.onchange=()=>{if(excelWorkbook)loadCurrentSheet();else render()};Y.onchange=()=>{if(excelWorkbook)loadCurrentSheet();else render()};C.onchange=()=>{localStorage.setItem("zeiterfassung_canton",C.value);render()};
 
 document.getElementById("saveBtn").onclick=saveMaster;document.getElementById("openBtn").onclick=connectFolder;init();setTimeout(autoMaster,0);
+window.addEventListener("beforeunload",e=>{if(dirty){e.preventDefault();e.returnValue=""}});
 </script></body></html>
